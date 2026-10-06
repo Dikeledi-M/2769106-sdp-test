@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.security import ACCESS_TOKEN_TYPE, decode_token
 from app.db.session import get_db
+from app.models.repository import Repository
 from app.models.user import User
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -47,3 +48,11 @@ def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def get_owned_repository(db: Session, repository_id: int, user: User) -> Repository:
+    """Return the repository if it exists and belongs to ``user``; 404 otherwise."""
+    repository = db.get(Repository, repository_id)
+    if repository is None or repository.owner_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found")
+    return repository

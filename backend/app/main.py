@@ -5,7 +5,7 @@ Run with:  uvicorn app.main:app --reload
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import auth, health, metrics
+from app.api.routes import auth, health, metrics, repositories
 from app.core.config import settings
 
 app = FastAPI(
@@ -26,4 +26,5 @@ if settings.cors_origins:
 
 app.include_router(health.router, prefix=settings.API_V1_PREFIX)
 app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
+app.include_router(repositories.router, prefix=settings.API_V1_PREFIX)
 app.include_router(metrics.router, prefix=settings.API_V1_PREFIX)

@@ -1,48 +1,57 @@
-"""File and directory metrics over a commit set.
+"""Metrics over a commit set: file, directory, repository, and author.
 
 Definitions
 -----------
-Let ``H`` be a commit set: a subset of the non-merge commits reachable from
-a reference (typically HEAD), optionally narrowed by a committer-date range,
-an explicit commit list, or a set of authors. For every object (file or
-directory) the metrics are sums of the per-commit diff values of ``H``:
+Let ``H`` be a commit set: a subset of the non-merge commits reachable from a
+reference (typically HEAD), optionally narrowed by a committer-date range, an
+explicit commit list, or a set of authors. For every object ``o`` - a file in
+``H[F]`` or a directory in ``H[D]`` (the root is the empty path ``""``) - the
+metrics are sums of the per-commit diff values over ``H``:
 
-* ``l+``  file added lines, ``l-`` file removed lines;
-* growth ``delta = l+ - l-``, churn ``lambda = l+ + l-``.
+* file metrics: ``l+`` added lines, ``l-`` removed lines, growth
+  ``delta = l+ - l-``, churn ``lambda = l+ + l-``;
+* directory metrics: the same four values rolled up recursively over all
+  immediate child files and subdirectories (equivalent to accumulating each
+  changed file into every ancestor directory);
+* commit set metrics: modifications ``n`` (commits in ``H`` with
+  ``lambda > 0`` on ``o``), modification frequency ``eta = n / |H|`` and
+  churn rate ``rho = lambda / |H|`` (zero for an empty commit set);
+* author metrics: per author ``a`` - modifications, churn and ownership
+  ``omega = lambda_a / lambda`` for the scoped object (zero when the object
+  has no churn).
 
-These map onto :class:`ObjectMetrics`: ``added_lines``/``removed_lines`` are
-``l+``/``l-``, ``growth`` is ``delta`` and ``churn`` is ``lambda``.
+Repository metrics are the directory metrics of the repository root.
 
 Rename handling comes for free: the ingestion stores every diff entry on its
-new path (``--find-renames=50%``), so a pure rename contributes ``0/0`` and a
-rename combined with edits contributes only the edits, attributed to the new
-path. A deletion is stored as an entry on the deleted path and therefore
-counts as removed lines there. Binary files are excluded (git's own binary
-detection, recorded as ``is_binary`` at ingestion time).
-
-Directory metrics roll the same totals up: each changed file accumulates into
-every one of its ancestor directories, which is equivalent to the recursive
-"immediate objects" definition. The repository root is the empty path ``""``.
+new path (``--find-renames=50%``), so a pure rename contributes ``0/0`` (zero
+churn, never a modification) and a rename combined with edits contributes
+only the edits, attributed to the new path. A deletion is stored as an entry
+on the deleted path and therefore counts as removed lines there. Binary files
+are excluded (git's own binary detection, recorded as ``is_binary`` at
+ingestion time).
 
 Scope notes
 -----------
 * Only objects with at least one diff row in the commit set are listed. Any
   other object contributes ``0/0/0/0`` to every metric, so listing presence
-  follows change events; full trees are never materialised.
+  follows change events; full trees are never materialised. Authors are
+  listed per object with the same rule (no diff rows in scope, no entry).
 * An optional ``path`` narrows the reported scope: files below ``p``
   (``path == p`` or ``path.startswith(p + "/")``); directories are reported
-  within the same scope, i.e. ancestors above ``p`` are dropped.
+  within the same scope, i.e. ancestors above ``p`` are dropped. Author
+  metrics scope to the object itself (``p``) or the subtree below it.
 * Datetimes are normalised to UTC before querying, matching the storage
   format written by the ingestion service.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.models.author import Author
 from app.models.commit import Commit, CommitFile
 from app.models.repository import Repository
 
@@ -88,6 +97,20 @@ class ObjectMetrics:
     removed_lines: int
     growth: int
     churn: int
+    modifications: int
+    modification_frequency: float
+    churn_rate: float
+
+
+@dataclass(frozen=True)
+class AuthorMetrics:
+    """Per-author metrics on one object within the commit set."""
+
+    author_id: int
+    display_name: str
+    modifications: int
+    churn: int
+    ownership: float
 
 
 @dataclass
@@ -96,6 +119,23 @@ class MetricsResult:
 
     commit_count: int
     objects: list[ObjectMetrics] = field(default_factory=list)
+
+
+@dataclass
+class RepositoryMetricsResult:
+    """Repository metrics: the root directory of the commit tree."""
+
+    commit_count: int
+    root: ObjectMetrics
+
+
+@dataclass
+class AuthorMetricsResult:
+    """Author metrics for one object (a file, a directory, or the root)."""
+
+    commit_count: int
+    path: str
+    authors: list[AuthorMetrics] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +211,19 @@ def resolve_commit_ids(
 # ---------------------------------------------------------------------------
 
 
-def _aggregate_files(
-    db: Session, commit_ids: list[int], path: str | None
-) -> dict[str, tuple[int, int]]:
-    """Sum (added, removed) per changed file path over the given commits."""
+_ChangeRow = tuple[int, str, int, int]  # commit_id, path, added lines, removed lines
+
+
+def _collect_rows(db: Session, commit_ids: list[int], path: str | None) -> list[_ChangeRow]:
+    """Changed non-binary files as ``(commit_id, path, added, removed)`` rows.
+
+    There is at most one diff entry per path per commit, so each row is one
+    ``(h, o)`` pair of the spec - the granularity needed for modifications
+    (``lambda_h,o > 0``) and per-author attribution.
+    """
+    rows: list[_ChangeRow] = []
     if not commit_ids:
-        return {}
+        return rows
 
     conditions = [CommitFile.is_binary.is_(False)]
     if path is not None:
@@ -184,24 +231,42 @@ def _aggregate_files(
             or_(CommitFile.path == path, CommitFile.path.startswith(path + "/"))
         )
 
-    totals: dict[str, list[int]] = {}
     for start in range(0, len(commit_ids), _QUERY_BATCH):
         batch = commit_ids[start : start + _QUERY_BATCH]
         statement = (
             select(
+                CommitFile.commit_id,
                 CommitFile.path,
-                func.coalesce(func.sum(CommitFile.insertions), 0),
-                func.coalesce(func.sum(CommitFile.deletions), 0),
+                func.sum(func.coalesce(CommitFile.insertions, 0)),
+                func.sum(func.coalesce(CommitFile.deletions, 0)),
             )
             .where(CommitFile.commit_id.in_(batch), *conditions)
-            .group_by(CommitFile.path)
+            .group_by(CommitFile.commit_id, CommitFile.path)
         )
-        for file_path, added, removed in db.execute(statement):
-            accumulator = totals.setdefault(file_path, [0, 0])
-            accumulator[0] += int(added)
-            accumulator[1] += int(removed)
+        rows.extend(
+            (int(commit_id), file_path, int(added), int(removed))
+            for commit_id, file_path, added, removed in db.execute(statement)
+        )
+    return rows
 
+
+def _file_totals(rows: list[_ChangeRow]) -> dict[str, tuple[int, int]]:
+    """Sum ``(added, removed)`` per changed file path."""
+    totals: dict[str, list[int]] = {}
+    for _, file_path, added, removed in rows:
+        accumulator = totals.setdefault(file_path, [0, 0])
+        accumulator[0] += added
+        accumulator[1] += removed
     return {file_path: (added, removed) for file_path, (added, removed) in totals.items()}
+
+
+def _file_modifications(rows: list[_ChangeRow]) -> dict[str, int]:
+    """Commits with ``lambda_h,f > 0`` per file (``Gamma(h, f) = 1``)."""
+    counts: dict[str, int] = {}
+    for _, file_path, added, removed in rows:
+        if added + removed > 0:
+            counts[file_path] = counts.get(file_path, 0) + 1
+    return counts
 
 
 def _ancestor_dirs(path: str) -> list[str]:
@@ -212,17 +277,72 @@ def _ancestor_dirs(path: str) -> list[str]:
     return directories
 
 
-def _to_objects(totals: dict[str, tuple[int, int]]) -> list[ObjectMetrics]:
-    objects = [
-        ObjectMetrics(
-            path=path,
-            added_lines=added,
-            removed_lines=removed,
-            growth=added - removed,
-            churn=added + removed,
+def _in_scope(directory: str, scope: str | None) -> bool:
+    """Whether a directory lies at or below the ``path`` filter scope."""
+    if scope is None:
+        return True
+    return directory == scope or directory.startswith(scope + "/")
+
+
+def _directory_totals(
+    file_totals: dict[str, tuple[int, int]], scope: str | None
+) -> dict[str, tuple[int, int]]:
+    """Roll the file totals up into every ancestor directory (root last)."""
+    totals: dict[str, list[int]] = {}
+    for file_path, (added, removed) in file_totals.items():
+        for directory in _ancestor_dirs(file_path):
+            if not _in_scope(directory, scope):
+                continue
+            accumulator = totals.setdefault(directory, [0, 0])
+            accumulator[0] += added
+            accumulator[1] += removed
+    return {directory: (added, removed) for directory, (added, removed) in totals.items()}
+
+
+def _directory_modifications(rows: list[_ChangeRow], scope: str | None) -> dict[str, int]:
+    """Commits with ``lambda_h,d > 0`` per directory (``Gamma(h, d) = 1``).
+
+    A directory counts a commit once, no matter how many files below it
+    changed, so the per-commit churn is aggregated before counting.
+    """
+    per_commit: dict[int, dict[str, int]] = {}
+    for commit_id, file_path, added, removed in rows:
+        churn = added + removed
+        if churn == 0:
+            continue
+        directories = per_commit.setdefault(commit_id, {})
+        for directory in _ancestor_dirs(file_path):
+            if _in_scope(directory, scope):
+                directories[directory] = directories.get(directory, 0) + churn
+
+    counts: dict[str, int] = {}
+    for directories in per_commit.values():
+        for directory in directories:
+            counts[directory] = counts.get(directory, 0) + 1
+    return counts
+
+
+def _to_objects(
+    totals: dict[str, tuple[int, int]],
+    modifications: dict[str, int],
+    commit_count: int,
+) -> list[ObjectMetrics]:
+    objects = []
+    for path, (added, removed) in totals.items():
+        churn = added + removed
+        count = modifications.get(path, 0)
+        objects.append(
+            ObjectMetrics(
+                path=path,
+                added_lines=added,
+                removed_lines=removed,
+                growth=added - removed,
+                churn=churn,
+                modifications=count,
+                modification_frequency=(count / commit_count) if commit_count else 0.0,
+                churn_rate=(churn / commit_count) if commit_count else 0.0,
+            )
         )
-        for path, (added, removed) in totals.items()
-    ]
     objects.sort(key=lambda item: item.path)
     return objects
 
@@ -235,32 +355,128 @@ def _to_objects(totals: dict[str, tuple[int, int]]) -> list[ObjectMetrics]:
 def file_metrics(
     db: Session, repository: Repository, filters: MetricsFilter | None = None
 ) -> MetricsResult:
-    """File metrics (added, removed, growth, churn) over the commit set."""
+    """File metrics: lines, growth, churn, modifications, rates."""
     filters = filters or MetricsFilter()
     commit_ids = resolve_commit_ids(db, repository, filters)
-    totals = _aggregate_files(db, commit_ids, filters.normalized_path)
-    return MetricsResult(commit_count=len(commit_ids), objects=_to_objects(totals))
+    rows = _collect_rows(db, commit_ids, filters.normalized_path)
+    return MetricsResult(
+        commit_count=len(commit_ids),
+        objects=_to_objects(_file_totals(rows), _file_modifications(rows), len(commit_ids)),
+    )
 
 
 def directory_metrics(
     db: Session, repository: Repository, filters: MetricsFilter | None = None
 ) -> MetricsResult:
-    """Directory metrics: the file totals rolled up into every ancestor."""
+    """Directory metrics: the file values rolled up into every ancestor."""
     filters = filters or MetricsFilter()
-    commit_ids = resolve_commit_ids(db, repository, filters)
     scope = filters.normalized_path
-    file_totals = _aggregate_files(db, commit_ids, scope)
+    commit_ids = resolve_commit_ids(db, repository, filters)
+    rows = _collect_rows(db, commit_ids, scope)
+    return MetricsResult(
+        commit_count=len(commit_ids),
+        objects=_to_objects(
+            _directory_totals(_file_totals(rows), scope),
+            _directory_modifications(rows, scope),
+            len(commit_ids),
+        ),
+    )
 
-    directory_totals: dict[str, list[int]] = {}
-    for file_path, (added, removed) in file_totals.items():
-        for directory in _ancestor_dirs(file_path):
-            if scope is not None and not (
-                directory == scope or directory.startswith(scope + "/")
-            ):
-                continue
-            accumulator = directory_totals.setdefault(directory, [0, 0])
-            accumulator[0] += added
-            accumulator[1] += removed
 
-    totals = {directory: (added, removed) for directory, (added, removed) in directory_totals.items()}
-    return MetricsResult(commit_count=len(commit_ids), objects=_to_objects(totals))
+def repository_metrics(
+    db: Session, repository: Repository, filters: MetricsFilter | None = None
+) -> RepositoryMetricsResult:
+    """Repository metrics: directory metrics on the root of the commit tree."""
+    filters = filters or MetricsFilter()
+    if filters.path is not None:  # the root is fixed; a path scope does not apply
+        filters = replace(filters, path=None)
+    commit_ids = resolve_commit_ids(db, repository, filters)
+    rows = _collect_rows(db, commit_ids, None)
+    objects = _to_objects(
+        _directory_totals(_file_totals(rows), None),
+        _directory_modifications(rows, None),
+        len(commit_ids),
+    )
+    root = next(
+        (item for item in objects if item.path == ""),
+        ObjectMetrics(
+            path="",
+            added_lines=0,
+            removed_lines=0,
+            growth=0,
+            churn=0,
+            modifications=0,
+            modification_frequency=0.0,
+            churn_rate=0.0,
+        ),
+    )
+    return RepositoryMetricsResult(commit_count=len(commit_ids), root=root)
+
+
+def author_metrics(
+    db: Session, repository: Repository, filters: MetricsFilter | None = None
+) -> AuthorMetricsResult:
+    """Author modifications, churn and ownership for the scoped object.
+
+    The scope defaults to the repository root; ``path`` selects a file or a
+    directory instead. Ownership is the author's share of the object's churn
+    (``lambda_a / lambda``), zero when the object has no churn.
+    """
+    filters = filters or MetricsFilter()
+    scope = filters.normalized_path
+    commit_ids = resolve_commit_ids(db, repository, filters)
+
+    commit_author = _commit_authors(db, commit_ids)
+    commit_churn: dict[int, int] = {}
+    for commit_id, _, added, removed in _collect_rows(db, commit_ids, scope):
+        if commit_id in commit_author:
+            commit_churn[commit_id] = commit_churn.get(commit_id, 0) + added + removed
+
+    churn_by_author: dict[int, int] = {}
+    modifications_by_author: dict[int, int] = {}
+    for commit_id, churn in commit_churn.items():
+        author_id = commit_author[commit_id]
+        churn_by_author[author_id] = churn_by_author.get(author_id, 0) + churn
+        if churn > 0:
+            modifications_by_author[author_id] = modifications_by_author.get(author_id, 0) + 1
+
+    total_churn = sum(churn_by_author.values())
+    names = _author_names(db, set(churn_by_author))
+    authors = [
+        AuthorMetrics(
+            author_id=author_id,
+            display_name=names.get(author_id, f"author #{author_id}"),
+            modifications=modifications_by_author.get(author_id, 0),
+            churn=churn,
+            ownership=(churn / total_churn) if total_churn else 0.0,
+        )
+        for author_id, churn in churn_by_author.items()
+    ]
+    authors.sort(key=lambda item: (-item.churn, item.display_name))
+    return AuthorMetricsResult(commit_count=len(commit_ids), path=scope or "", authors=authors)
+
+
+def _commit_authors(db: Session, commit_ids: list[int]) -> dict[int, int]:
+    """Canonical author id per commit id (after author merging)."""
+    authors: dict[int, int] = {}
+    for start in range(0, len(commit_ids), _QUERY_BATCH):
+        batch = commit_ids[start : start + _QUERY_BATCH]
+        statement = select(Commit.id, Commit.author_id).where(
+            Commit.id.in_(batch), Commit.author_id.is_not(None)
+        )
+        authors.update(
+            {int(commit_id): int(author_id) for commit_id, author_id in db.execute(statement)}
+        )
+    return authors
+
+
+def _author_names(db: Session, author_ids: set[int]) -> dict[int, str]:
+    names: dict[int, str] = {}
+    if not author_ids:
+        return names
+    ids = list(author_ids)
+    for start in range(0, len(ids), _QUERY_BATCH):
+        batch = ids[start : start + _QUERY_BATCH]
+        statement = select(Author.id, Author.display_name).where(Author.id.in_(batch))
+        names.update({int(author_id): name for author_id, name in db.execute(statement)})
+    return names

@@ -105,7 +105,10 @@ class ParsedCommit:
 def _git(repo_path: Path, *args: str) -> bytes:
     try:
         process = subprocess.run(
-            ["git", "-C", str(repo_path), *args],
+            # safe.directory: the stored archive / clone may sit on a mounted
+            # volume owned by another user (e.g. Docker); this is a read-only
+            # analysis tool, so the guard is intentionally lifted.
+            ["git", "-C", str(repo_path), "-c", "safe.directory=*", *args],
             capture_output=True,
         )
     except FileNotFoundError as exc:  # pragma: no cover - environment issue

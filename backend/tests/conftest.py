@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import settings
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -17,34 +18,53 @@ from tests.git_history import ScriptedRepo, build_scripted_repo
 
 
 @pytest.fixture()
-def db_session():
+def session_factory():
+    """A sessionmaker sharing one in-memory SQLite database per test."""
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    testing_session_local = sessionmaker(
+    factory = sessionmaker(
         bind=engine, autocommit=False, autoflush=False, expire_on_commit=False
     )
     Base.metadata.create_all(bind=engine)
+    yield factory
+    engine.dispose()
 
-    session = testing_session_local()
+
+@pytest.fixture()
+def db_session(session_factory):
+    session = session_factory()
     try:
         yield session
     finally:
         session.close()
-        engine.dispose()
 
 
 @pytest.fixture()
-def client(db_session: Session):
+def client(db_session: Session, session_factory, monkeypatch):
     def override_get_db():
         yield db_session
 
+    # Background import tasks open their own session; point them at the test DB.
+    monkeypatch.setattr("app.services.repository_import.SessionLocal", session_factory)
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def storage_dirs(tmp_path: Path, monkeypatch):
+    """Redirect archive/clone storage into the test's tmp directory."""
+    upload_dir = tmp_path / "uploads"
+    clone_dir = tmp_path / "clones"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    clone_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(settings, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(settings, "CLONE_DIR", clone_dir)
+    return upload_dir, clone_dir
 
 
 @pytest.fixture()

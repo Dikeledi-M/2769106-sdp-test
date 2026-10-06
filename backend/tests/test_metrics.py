@@ -1,4 +1,5 @@
-"""Tests for the file / directory metrics engine and the metrics API.
+"""Tests for the metrics engine (file / directory / repository / author) and
+the metrics API.
 
 Expected values are hand-derived from the scripted history documented in
 ``tests/git_history.py``; commit set boundary cases follow the spec:
@@ -7,7 +8,8 @@ Expected values are hand-derived from the scripted history documented in
   exclusive of ``j`` (committer dates);
 * ``H-bar`` excludes merge commits;
 * renames attribute their changes to the new path, deletions to the
-  deleted path, and binary files are never measured.
+  deleted path, and binary files are never measured;
+* pure renames (zero churn) are never counted as modifications.
 """
 import pytest
 from sqlalchemy import select
@@ -18,8 +20,10 @@ from app.models.repository import Repository
 from app.services.metrics import (
     MetricsError,
     MetricsFilter,
+    author_metrics,
     directory_metrics,
     file_metrics,
+    repository_metrics,
     resolve_commit_ids,
 )
 from tests.git_history import (
@@ -92,6 +96,45 @@ class TestFileMetrics:
         result = file_metrics(db_session, ingested_repository, filters)
         assert result.commit_count == 0
         assert result.objects == []
+
+
+class TestFileModifications:
+    def test_counts_commits_with_nonzero_churn(self, db_session, ingested_repository):
+        result = file_metrics(db_session, ingested_repository)
+        by_path = {obj.path: obj for obj in result.objects}
+        assert by_path["a.txt"].modifications == 2  # c1 and c2
+        assert by_path["sub/b.txt"].modifications == 2  # c1 and c2
+        assert by_path["sub/d.txt"].modifications == 2  # c4 and c5
+        assert by_path["feature.txt"].modifications == 1
+        assert by_path["readme.txt"].modifications == 1
+
+    def test_pure_rename_is_not_a_modification(self, db_session, ingested_repository):
+        result = file_metrics(db_session, ingested_repository)
+        by_path = {obj.path: obj for obj in result.objects}
+        assert by_path["sub/c.txt"].modifications == 0
+        assert by_path["sub/c.txt"].churn == 0
+        assert by_path["sub/c.txt"].modification_frequency == 0.0
+        assert by_path["sub/c.txt"].churn_rate == 0.0
+
+    def test_frequency_and_churn_rate(self, db_session, ingested_repository):
+        result = file_metrics(db_session, ingested_repository)
+        by_path = {obj.path: obj for obj in result.objects}
+        assert by_path["a.txt"].modification_frequency == pytest.approx(2 / 7)
+        assert by_path["a.txt"].churn_rate == pytest.approx(15 / 7)
+        assert by_path["sub/d.txt"].churn_rate == pytest.approx(10 / 7)
+        for obj in result.objects:  # rates are per-commit averages
+            assert obj.modification_frequency == pytest.approx(
+                obj.modifications / result.commit_count
+            )
+            assert obj.churn_rate == pytest.approx(obj.churn / result.commit_count)
+
+    def test_rates_over_smaller_commit_set(self, db_session, ingested_repository):
+        filters = MetricsFilter(from_ts=dt(C1_TIME), to_ts=dt(C3_TIME))  # c1, c2
+        result = file_metrics(db_session, ingested_repository, filters)
+        by_path = {obj.path: obj for obj in result.objects}
+        assert by_path["a.txt"].modification_frequency == pytest.approx(1.0)
+        assert by_path["a.txt"].churn_rate == pytest.approx(7.5)
+        assert by_path["sub/b.txt"].churn_rate == pytest.approx(3.0)
 
 
 class TestCommitSetResolution:
@@ -237,6 +280,117 @@ class TestPathFilter:
         assert files.objects == []
 
 
+class TestDirectoryModifications:
+    def test_root_counts_each_commit_once(self, db_session, ingested_repository):
+        result = directory_metrics(db_session, ingested_repository)
+        by_path = {obj.path: obj for obj in result.objects}
+        root = by_path[""]
+        assert root.modifications == 6  # c1, c2, c4, c5, c6, feature (c3 is a rename)
+        assert root.modification_frequency == pytest.approx(6 / 7)
+        assert root.churn_rate == pytest.approx(37 / 7)
+
+    def test_subdirectory_modifications(self, db_session, ingested_repository):
+        result = directory_metrics(db_session, ingested_repository)
+        by_path = {obj.path: obj for obj in result.objects}
+        sub = by_path["sub"]
+        assert sub.modifications == 4  # c1, c2, c4, c5
+        assert sub.modification_frequency == pytest.approx(4 / 7)
+        assert sub.churn_rate == pytest.approx(16 / 7)
+
+
+class TestRepositoryMetrics:
+    def test_root_of_the_commit_tree(self, db_session, ingested_repository):
+        result = repository_metrics(db_session, ingested_repository)
+        assert result.commit_count == 7
+        root = result.root
+        assert root.path == ""
+        assert (root.added_lines, root.removed_lines) == (27, 10)
+        assert (root.growth, root.churn) == (17, 37)
+        assert root.modifications == 6
+        assert root.modification_frequency == pytest.approx(6 / 7)
+        assert root.churn_rate == pytest.approx(37 / 7)
+
+    def test_matches_root_directory_metrics(self, db_session, ingested_repository):
+        result = repository_metrics(db_session, ingested_repository)
+        directories = directory_metrics(db_session, ingested_repository)
+        root = next(obj for obj in directories.objects if obj.path == "")
+        assert result.root == root
+
+    def test_time_range(self, db_session, ingested_repository):
+        filters = MetricsFilter(from_ts=dt(C1_TIME), to_ts=dt(C3_TIME))  # c1, c2
+        result = repository_metrics(db_session, ingested_repository, filters)
+        assert result.commit_count == 2
+        assert (result.root.added_lines, result.root.removed_lines) == (19, 2)
+        assert (result.root.growth, result.root.churn) == (17, 21)
+        assert result.root.modifications == 2
+        assert result.root.churn_rate == pytest.approx(10.5)
+
+    def test_empty_commit_set_is_all_zero(self, db_session, ingested_repository):
+        filters = MetricsFilter(from_ts=dt("2026-01-02T00:00:00+00:00"))
+        result = repository_metrics(db_session, ingested_repository, filters)
+        assert result.commit_count == 0
+        assert result.root.path == ""
+        assert (result.root.added_lines, result.root.removed_lines) == (0, 0)
+        assert (result.root.growth, result.root.churn) == (0, 0)
+        assert result.root.modifications == 0
+        assert result.root.modification_frequency == 0.0
+        assert result.root.churn_rate == 0.0
+
+
+class TestAuthorMetrics:
+    def test_full_commit_set(self, db_session, ingested_repository):
+        result = author_metrics(db_session, ingested_repository)
+        assert result.commit_count == 7
+        assert result.path == ""
+        assert [author.display_name for author in result.authors] == ["Alice", "Bob"]
+        alice, bob = result.authors
+        assert (alice.churn, alice.modifications) == (31, 4)  # c3 is a pure rename
+        assert (bob.churn, bob.modifications) == (6, 2)
+        assert alice.ownership == pytest.approx(31 / 37)
+        assert bob.ownership == pytest.approx(6 / 37)
+
+    def test_ownership_sums_to_one(self, db_session, ingested_repository):
+        result = author_metrics(db_session, ingested_repository)
+        assert sum(author.ownership for author in result.authors) == pytest.approx(1.0)
+
+    def test_author_ids_are_canonical(self, db_session, ingested_repository):
+        alice = _author(db_session, ingested_repository, "alice@example.com")
+        result = author_metrics(db_session, ingested_repository)
+        assert result.authors[0].author_id == alice.id
+
+    def test_directory_scope(self, db_session, ingested_repository):
+        result = author_metrics(db_session, ingested_repository, MetricsFilter(path="sub"))
+        assert result.path == "sub"
+        assert len(result.authors) == 1
+        alice = result.authors[0]
+        assert alice.display_name == "Alice"
+        assert (alice.churn, alice.modifications) == (16, 4)
+        assert alice.ownership == pytest.approx(1.0)
+
+    def test_file_scope(self, db_session, ingested_repository):
+        filters = MetricsFilter(path="sub/d.txt")
+        result = author_metrics(db_session, ingested_repository, filters)
+        assert result.path == "sub/d.txt"
+        assert len(result.authors) == 1
+        assert (result.authors[0].churn, result.authors[0].modifications) == (10, 2)
+
+    def test_author_filter_restricts_the_commit_set(self, db_session, ingested_repository):
+        bob = _author(db_session, ingested_repository, "bob@example.com")
+        filters = MetricsFilter(author_ids=(bob.id,))
+        result = author_metrics(db_session, ingested_repository, filters)
+        assert result.commit_count == 2
+        assert [(author.display_name, author.churn) for author in result.authors] == [
+            ("Bob", 6)
+        ]
+        assert result.authors[0].ownership == pytest.approx(1.0)
+
+    def test_empty_commit_set(self, db_session, ingested_repository):
+        filters = MetricsFilter(from_ts=dt("2026-01-02T00:00:00+00:00"))
+        result = author_metrics(db_session, ingested_repository, filters)
+        assert result.commit_count == 0
+        assert result.authors == []
+
+
 class TestMetricsApi:
     def test_file_metrics_endpoint(self, client, registered_user, api_repository):
         response = client.get(
@@ -364,3 +518,65 @@ class TestMetricsApi:
     def test_requires_authentication(self, client, api_repository):
         response = client.get(f"{API}/repositories/{api_repository.id}/metrics/files")
         assert response.status_code == 401
+
+    def test_file_metrics_expose_rates(self, client, registered_user, api_repository):
+        response = client.get(
+            f"{API}/repositories/{api_repository.id}/metrics/files",
+            headers=_headers(registered_user),
+        )
+        assert response.status_code == 200, response.text
+        a_txt = next(
+            item for item in response.json()["files"] if item["path"] == "a.txt"
+        )
+        assert a_txt["modifications"] == 2
+        assert a_txt["modification_frequency"] == pytest.approx(2 / 7)
+        assert a_txt["churn_rate"] == pytest.approx(15 / 7)
+
+    def test_repository_metrics_endpoint(self, client, registered_user, api_repository):
+        response = client.get(
+            f"{API}/repositories/{api_repository.id}/metrics/repository",
+            headers=_headers(registered_user),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["commit_count"] == 7
+        root = body["repository"]
+        assert root["path"] == ""
+        assert (root["added_lines"], root["removed_lines"]) == (27, 10)
+        assert (root["growth"], root["churn"]) == (17, 37)
+        assert root["modifications"] == 6
+        assert root["churn_rate"] == pytest.approx(37 / 7)
+
+    def test_author_metrics_endpoint(self, client, registered_user, api_repository):
+        response = client.get(
+            f"{API}/repositories/{api_repository.id}/metrics/authors",
+            headers=_headers(registered_user),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["commit_count"] == 7
+        assert body["path"] == ""
+        assert [author["display_name"] for author in body["authors"]] == ["Alice", "Bob"]
+        alice, bob = body["authors"]
+        assert (alice["churn"], alice["modifications"]) == (31, 4)
+        assert alice["ownership"] == pytest.approx(31 / 37)
+        assert bob["ownership"] == pytest.approx(6 / 37)
+
+    def test_author_metrics_path_param(self, client, registered_user, api_repository):
+        response = client.get(
+            f"{API}/repositories/{api_repository.id}/metrics/authors",
+            params={"path": "sub"},
+            headers=_headers(registered_user),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["path"] == "sub"
+        assert [author["display_name"] for author in body["authors"]] == ["Alice"]
+        assert body["authors"][0]["churn"] == 16
+
+    def test_new_endpoints_require_authentication(self, client, api_repository):
+        for suffix in ("repository", "authors"):
+            response = client.get(
+                f"{API}/repositories/{api_repository.id}/metrics/{suffix}"
+            )
+            assert response.status_code == 401

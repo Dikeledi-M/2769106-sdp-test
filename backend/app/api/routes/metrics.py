@@ -1,4 +1,4 @@
-"""File and directory metrics endpoints.
+"""File, directory, repository and author metrics endpoints.
 
 The commit set ``H`` defaults to every non-merge commit reachable from HEAD
 (i.e. everything ingested) and can be narrowed with:
@@ -10,24 +10,31 @@ The commit set ``H`` defaults to every non-merge commit reachable from HEAD
 * ``reference`` - keep only commits reachable from this SHA.
 
 ``path`` restricts the reported objects to a file or directory and its
-contents. Repositories are only visible to their owner (404 otherwise).
+contents; the repository endpoint always reports the root. Repositories are
+only visible to their owner (404 otherwise).
 """
+from dataclasses import replace
 from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import CurrentUser
+from app.api.deps import CurrentUser, get_owned_repository
 from app.db.session import get_db
-from app.models.repository import Repository
-from app.models.user import User
-from app.schemas.metrics import DirectoryMetricsResponse, FileMetricsResponse
+from app.schemas.metrics import (
+    AuthorMetricsResponse,
+    DirectoryMetricsResponse,
+    FileMetricsResponse,
+    RepositoryMetricsResponse,
+)
 from app.services.metrics import (
     MetricsError,
     MetricsFilter,
+    author_metrics,
     directory_metrics,
     file_metrics,
+    repository_metrics,
 )
 
 router = APIRouter(prefix="/repositories", tags=["metrics"])
@@ -35,7 +42,7 @@ router = APIRouter(prefix="/repositories", tags=["metrics"])
 DbSession = Annotated[Session, Depends(get_db)]
 
 
-def commit_set_filter(
+def commit_set_filter_no_path(
     from_ts: Annotated[
         datetime | None,
         Query(alias="from", description="Commits with committer date >= this timestamp"),
@@ -53,9 +60,6 @@ def commit_set_filter(
     reference: Annotated[
         str | None, Query(description="Keep only commits reachable from this SHA")
     ] = None,
-    path: Annotated[
-        str | None, Query(description="Restrict the reported objects to this path")
-    ] = None,
 ) -> MetricsFilter:
     return MetricsFilter(
         from_ts=from_ts,
@@ -63,18 +67,20 @@ def commit_set_filter(
         commit_shas=tuple(commit or ()),
         author_ids=tuple(author or ()),
         reference_sha=reference,
-        path=path,
     )
 
 
+def commit_set_filter(
+    base: Annotated[MetricsFilter, Depends(commit_set_filter_no_path)],
+    path: Annotated[
+        str | None, Query(description="Restrict the reported objects to this path")
+    ] = None,
+) -> MetricsFilter:
+    return replace(base, path=path)
+
+
+CommitSetFilterNoPath = Annotated[MetricsFilter, Depends(commit_set_filter_no_path)]
 CommitSetFilter = Annotated[MetricsFilter, Depends(commit_set_filter)]
-
-
-def _get_owned_repository(db: Session, repository_id: int, user: User) -> Repository:
-    repository = db.get(Repository, repository_id)
-    if repository is None or repository.owner_id != user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found")
-    return repository
 
 
 def _bad_reference(exc: MetricsError) -> HTTPException:
@@ -88,7 +94,7 @@ def get_file_metrics(
     current_user: CurrentUser,
     db: DbSession,
 ) -> FileMetricsResponse:
-    repository = _get_owned_repository(db, repository_id, current_user)
+    repository = get_owned_repository(db, repository_id, current_user)
     try:
         result = file_metrics(db, repository, filters)
     except MetricsError as exc:
@@ -103,11 +109,43 @@ def get_directory_metrics(
     current_user: CurrentUser,
     db: DbSession,
 ) -> DirectoryMetricsResponse:
-    repository = _get_owned_repository(db, repository_id, current_user)
+    repository = get_owned_repository(db, repository_id, current_user)
     try:
         result = directory_metrics(db, repository, filters)
     except MetricsError as exc:
         raise _bad_reference(exc) from exc
     return DirectoryMetricsResponse(
         commit_count=result.commit_count, directories=result.objects
+    )
+
+
+@router.get("/{repository_id}/metrics/repository", response_model=RepositoryMetricsResponse)
+def get_repository_metrics(
+    repository_id: int,
+    filters: CommitSetFilterNoPath,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> RepositoryMetricsResponse:
+    repository = get_owned_repository(db, repository_id, current_user)
+    try:
+        result = repository_metrics(db, repository, filters)
+    except MetricsError as exc:
+        raise _bad_reference(exc) from exc
+    return RepositoryMetricsResponse(commit_count=result.commit_count, repository=result.root)
+
+
+@router.get("/{repository_id}/metrics/authors", response_model=AuthorMetricsResponse)
+def get_author_metrics(
+    repository_id: int,
+    filters: CommitSetFilter,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> AuthorMetricsResponse:
+    repository = get_owned_repository(db, repository_id, current_user)
+    try:
+        result = author_metrics(db, repository, filters)
+    except MetricsError as exc:
+        raise _bad_reference(exc) from exc
+    return AuthorMetricsResponse(
+        commit_count=result.commit_count, path=result.path, authors=result.authors
     )
