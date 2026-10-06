@@ -86,7 +86,9 @@ export async function apiFetch<T>(
   allowRetry = true,
 ): Promise<T> {
   const headers = new Headers(options.headers)
-  if (options.body && !headers.has('Content-Type')) {
+  // JSON sentinel: strings are JSON bodies; FormData must keep the browser's
+  // own multipart Content-Type (with boundary).
+  if (typeof options.body === 'string' && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
   const tokens = getTokens()

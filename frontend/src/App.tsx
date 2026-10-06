@@ -3,6 +3,7 @@ import { RequireAuth } from './auth/RequireAuth'
 import { DashboardPage } from './pages/DashboardPage'
 import { LoginPage } from './pages/LoginPage'
 import { RegisterPage } from './pages/RegisterPage'
+import { RepositoryDetailPage } from './pages/RepositoryDetailPage'
 
 export default function App() {
   return (
@@ -14,6 +15,14 @@ export default function App() {
         element={
           <RequireAuth>
             <DashboardPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/repositories/:repositoryId"
+        element={
+          <RequireAuth>
+            <RepositoryDetailPage />
           </RequireAuth>
         }
       />
