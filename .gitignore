@@ -1,0 +1,34 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Databases ---
+*.db
+*.sqlite3
+
+# --- RAT data (uploaded ZIPs and cloned repositories) ---
+backend/data/uploads/*
+backend/data/clones/*
+!backend/data/uploads/.gitkeep
+!backend/data/clones/.gitkeep
+
+# --- Node / frontend ---
+node_modules/
+dist/
+*.local
+
+# --- Environment ---
+.env
+.env.*
+!.env.example
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
