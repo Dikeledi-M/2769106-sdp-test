@@ -32,6 +32,7 @@ class Commit(Base):
     __table_args__ = (
         UniqueConstraint("repository_id", "sha", name="uq_commit_repo_sha"),
         Index("ix_commits_repo_authored_at", "repository_id", "authored_at"),
+        Index("ix_commits_repo_committed_at", "repository_id", "committed_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

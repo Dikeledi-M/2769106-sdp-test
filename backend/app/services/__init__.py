@@ -1,14 +1,14 @@
 """Domain services for the RAT.
 
-The ingestion and metrics pipeline lives here (added in the next milestones):
+The ingestion and metrics pipeline lives here:
 
-* ``ingestion`` - import a repository from a ZIP archive (containing ``.git``)
-  or by deep-cloning a remote URL; walk history and persist commits,
-  per-file changes, and raw author identities.
-* ``mailmap`` - parse the repository's ``.mailmap`` file and resolve raw
-  git identities to canonical authors; supports manual merges when no
+* ``git_ingest`` - walk the history of a repository working copy (including
+  ``.git``) and persist commits, per-file diff statistics, and raw author
+  identities (grouped into canonical authors by email).
+* ``metrics`` - aggregate ``CommitFile`` rows into file and directory metrics
+  (added/removed lines, growth, churn) over a commit set, filterable by
+  committer-date range, explicit commits, authors, reference, and path.
+* ``mailmap`` - planned: parse the repository's ``.mailmap`` file and resolve
+  raw git identities to canonical authors; supports manual merges when no
   mailmap exists.
-* ``metrics`` - aggregate ``Commit`` / ``CommitFile`` rows into per-author,
-  per-file, per-directory, and repository-wide metrics, filterable by
-  repository, author, path, and commit range (time span or explicit list).
 """
