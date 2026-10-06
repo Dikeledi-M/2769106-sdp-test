@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
+import { ThemeToggle } from '../theme/ThemeToggle'
 
 export function RegisterPage() {
   const { register } = useAuth()
@@ -34,6 +35,9 @@ export function RegisterPage() {
 
   return (
     <div className="auth-page">
+      <div className="auth-theme-toggle">
+        <ThemeToggle />
+      </div>
       <div className="auth-card">
         <div className="auth-brand">
           <span className="brand-mark">RAT</span>

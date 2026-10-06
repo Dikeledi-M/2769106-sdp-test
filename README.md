@@ -149,6 +149,11 @@ origin instead, add that origin to `BACKEND_CORS_ORIGINS` in `backend/.env`.
 
 ## Using the web app
 
+The UI ships with GitHub-inspired light and dark themes. Use the round moon/sun
+button at the top right (on the sign-in page and in the top bar) to switch; the
+choice is remembered in your browser, and until you pick one the OS preference
+is followed automatically.
+
 ### 1. Create an account
 
 Open <http://localhost:5173>. You will be redirected to the login page — click

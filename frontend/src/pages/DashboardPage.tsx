@@ -16,6 +16,7 @@ import {
 } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
+import { ThemeToggle } from '../theme/ThemeToggle'
 import {
   cloneRepository,
   deleteRepository,
@@ -155,6 +156,7 @@ export function DashboardPage() {
         </div>
         <div className="topbar-user">
           <span className="user-chip">{user?.username}</span>
+          <ThemeToggle />
           <button type="button" className="btn btn-ghost" onClick={handleLogout}>
             Sign out
           </button>

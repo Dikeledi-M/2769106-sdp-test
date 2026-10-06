@@ -16,6 +16,7 @@ import {
   fetchRepositoryMetrics,
 } from '../api/metrics'
 import { getRepository, listAuthors, listCommits, listFiles } from '../api/repositories'
+import { ThemeToggle } from '../theme/ThemeToggle'
 import type {
   Author,
   AuthorMetricsResponse,
@@ -292,6 +293,7 @@ export function RepositoryDetailPage() {
           {repository && (
             <span className={`badge badge-${repository.status}`}>{repository.status}</span>
           )}
+          <ThemeToggle />
         </div>
       </header>
 
